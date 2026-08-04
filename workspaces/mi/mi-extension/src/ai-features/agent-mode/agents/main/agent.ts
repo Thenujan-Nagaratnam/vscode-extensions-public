@@ -21,19 +21,27 @@
 // ============================================================================
 export const ENABLE_LANGFUSE = false; // Set to false to disable Langfuse tracing
 export const ENABLE_DEVTOOLS = false; // Set to true to enable AI SDK DevTools (local development only!)
-export const ENABLE_MEMORY_TOOL = false; // Set to true to enable Anthropic native memory tool (persistent project-scoped memory across sessions)
 export const ENABLE_NATIVE_COMPACTION = true; // Set to true to enable Anthropic native server-side compaction (auto-summarizes when context grows large)
 
 // Native compaction trigger threshold in tokens.
 // When input tokens exceed this value, the API auto-compacts the conversation.
 // Must be at least 50,000. Default Anthropic value is 150,000.
-const NATIVE_COMPACTION_TRIGGER_TOKENS = 180000;
+const NATIVE_COMPACTION_TRIGGER_TOKENS = 200000;
 
 import { ModelMessage, streamText, stepCountIs, UserModelMessage, SystemModelMessage, wrapLanguageModel } from 'ai';
 import { AnthropicProviderOptions } from '@ai-sdk/anthropic';
 import { getAnthropicClient, getAnthropicClientForCustomModel, getAnthropicProvider, AnthropicModel, resolveMainModelId } from '../../../connection';
+import { getLoginMethod, getTavilyApiKey } from '../../../auth';
 import { getSystemPrompt } from '../main/system';
-import { getUserPrompt, UserPromptParams, UserPromptContentBlock } from './prompt';
+import {
+    BlockInjectionStatus,
+    BlockInjectionStatuses,
+    computeSessionContextBlockHashes,
+    getUserPrompt,
+    SessionContextBlockHashes,
+    UserPromptContentBlock,
+    UserPromptParams,
+} from './prompt';
 import { addCacheControlToMessages } from '../../../cache-utils';
 import { buildMessageContent } from '../../attachment-utils';
 import { COMPACT_SYSTEM_REMINDER_AUTO_TRIGGERED } from '../compact/prompt';
@@ -43,9 +51,6 @@ import {
     PendingPlanApproval,
 } from '../../tools/plan_mode_tools';
 import { getRuntimeVersionFromPom } from '../../tools/connector_store_cache';
-import { DEEPWIKI_MCP_TOOL_NAMES, DEEPWIKI_MCP_SERVER_CONFIG } from '../../tools/deepwiki_tools';
-import { createMemoryExecute, createReadOnlyMemoryExecute } from '../../tools/memory_tools';
-import { getCopilotProjectMemoriesDir } from '../../storage-paths';
 import {
     createAgentTools,
     FILE_WRITE_TOOL_NAME,
@@ -64,13 +69,15 @@ import {
     KILL_TASK_TOOL_NAME,
     WEB_SEARCH_TOOL_NAME,
     WEB_FETCH_TOOL_NAME,
+    DEEPWIKI_ASK_QUESTION_TOOL_NAME,
 } from './tools';
 import { logInfo, logError, logDebug } from '../../../copilot/logger';
-import { ChatHistoryManager, TOOL_USE_INTERRUPTION_CONTEXT } from '../../chat-history-manager';
+import { ChatHistoryManager, SessionContextBlocksState, TOOL_USE_INTERRUPTION_CONTEXT } from '../../chat-history-manager';
 import { getToolAction } from '../../tool-action-mapper';
 import { AgentUndoCheckpointManager } from '../../undo/checkpoint-manager';
 import { getCopilotSessionDir } from '../../storage-paths';
 import { ShellApprovalRuleStore } from '../../tools/types';
+import { WebToolsProvider } from '../../tools/web_tools';
 import {
     awaitWithTimeout,
     createProxyTerminatedError,
@@ -86,7 +93,7 @@ import {
 } from '../../stream_guard';
 
 // Import types from mi-core (shared with visualizer)
-import { AgentEvent, AgentEventType, FileObject, ImageObject, AgentMode, ModelSettings } from '@wso2/mi-core';
+import { AgentEvent, AgentEventType, FileObject, ImageObject, AgentMode, LoginMethod, ModelSettings } from '@wso2/mi-core';
 
 // Re-export types for other modules that import from agent.ts
 export type { AgentEvent, AgentEventType };
@@ -123,10 +130,6 @@ export interface AgentRequest {
     images?: ImageObject[];
     /** Enable Claude thinking mode (reasoning blocks) */
     thinking?: boolean;
-    /** Enable persistent cross-session memory tool */
-    memoryEnabled?: boolean;
-    /** Skip per-call web approval prompts when true */
-    webAccessPreapproved?: boolean;
     /** Path to the MI project */
     projectPath: string;
     /** Map of file path to content for relevant existing code (optional, for future use) */
@@ -193,6 +196,100 @@ interface NormalizedToolResultForUi {
     [key: string]: unknown;
 }
 
+/**
+ * Compare a per-block tracking value against its persisted predecessor and
+ * decide what to render. `omit`: same as last turn — skip rendering.
+ * `first-injection`: never injected before (or full re-prime needed) — render
+ * without notice. `re-injection`: value drifted — render with a
+ * "[context updated]" notice. `cleared`: was injected before but is now
+ * absent (e.g. payloads removed by the user) — render an explicit removal
+ * notice and clear the persisted hash so future injections start fresh.
+ */
+function decideBlockStatus(
+    current: string | undefined,
+    previous: string | undefined,
+    forceFirstInjection: boolean,
+): BlockInjectionStatus {
+    if (current === undefined) {
+        // Was injected on a prior turn but absent now — emit a removal notice
+        // so the model doesn't keep referencing the stale prior-turn block.
+        // First-message / post-compaction wipes prior context, so 'omit' there.
+        if (previous !== undefined && !forceFirstInjection) {
+            return 'cleared';
+        }
+        return 'omit';
+    }
+    if (forceFirstInjection || previous === undefined) {
+        return 'first-injection';
+    }
+    return previous === current ? 'omit' : 're-injection';
+}
+
+/**
+ * Merge the current per-block hashes into the persisted state, but only for
+ * blocks we're about to inject this turn. Returns `undefined` when no block
+ * needs persisting (avoids a no-op metadata write).
+ */
+function buildUpdatedBlocksState(
+    previous: SessionContextBlocksState,
+    current: SessionContextBlockHashes,
+    statuses: BlockInjectionStatuses,
+): SessionContextBlocksState | undefined {
+    const updated: SessionContextBlocksState = { ...previous };
+    let touched = false;
+    // 'cleared' wipes the persisted hash so the next non-empty injection
+    // counts as 'first-injection' rather than 're-injection'. In practice
+    // only payloads can be cleared (other blocks always have a current hash),
+    // but applying uniformly keeps the semantics consistent.
+    const apply = <K extends keyof SessionContextBlocksState>(
+        key: K,
+        status: BlockInjectionStatus,
+        nextHash: SessionContextBlocksState[K] | undefined,
+    ): void => {
+        if (status === 'cleared') {
+            updated[key] = undefined as SessionContextBlocksState[K];
+            touched = true;
+        } else if (status !== 'omit') {
+            updated[key] = nextHash as SessionContextBlocksState[K];
+            touched = true;
+        }
+    };
+    apply('env', statuses.env, current.env);
+    apply('connectors', statuses.connectors, current.connectors);
+    apply('webAvailability', statuses.webAvailability, current.webAvailability);
+    apply('modePolicy', statuses.modePolicy, current.modePolicy);
+    apply('payloads', statuses.payloads, current.payloads);
+    return touched ? updated : undefined;
+}
+
+function logBlockInjectionDrift(
+    statuses: BlockInjectionStatuses,
+    previous: SessionContextBlocksState,
+    current: SessionContextBlockHashes,
+): void {
+    const driftedBlocks: string[] = [];
+    const note = (
+        name: string,
+        status: BlockInjectionStatus,
+        prev: string | undefined,
+        next: string | undefined,
+    ): void => {
+        if (status === 're-injection') {
+            driftedBlocks.push(`${name}(${prev}→${next})`);
+        } else if (status === 'cleared') {
+            driftedBlocks.push(`${name}(${prev}→cleared)`);
+        }
+    };
+    note('env', statuses.env, previous.env, current.env);
+    note('connectors', statuses.connectors, previous.connectors, current.connectors);
+    note('webAvailability', statuses.webAvailability, previous.webAvailability, current.webAvailability);
+    note('mode', statuses.modePolicy, previous.modePolicy, current.modePolicy);
+    note('payloads', statuses.payloads, previous.payloads, current.payloads);
+    if (driftedBlocks.length > 0) {
+        logInfo(`[Agent] Session-context drift — re-injecting: ${driftedBlocks.join(', ')}`);
+    }
+}
+
 const TOOL_INTERRUPTION_ERROR_CODE = 'AGENT_TOOL_INTERRUPTION';
 const MODEL_ERROR_PATTERN = /model.*not found|invalid.*model|unknown model|could not resolve model|model.*deprecated|model.*not available|model.*does not exist|model.*decommissioned/i;
 
@@ -222,7 +319,7 @@ function getStructuredErrorName(error: unknown): string | undefined {
     return typeof name === 'string' ? name : undefined;
 }
 
-function isToolInterruptionAbortError(error: unknown): boolean {
+export function isToolInterruptionAbortError(error: unknown): boolean {
     if (!error) {
         return false;
     }
@@ -431,6 +528,20 @@ export async function executeAgent(
     // Session directory for output files (build.txt, run.txt)
     const sessionDir = getCopilotSessionDir(request.projectPath, sessionId);
 
+    // Declared outside the try so the catch path can also flush open thinking
+    // blocks (errors / aborts mid-stream would otherwise leave the UI's
+    // <thinking data-loading="true"> spinner stuck forever).
+    const reasoningById = new Map<string, string>();
+    const flushOpenThinkingBlocks = (): void => {
+        if (reasoningById.size === 0) {
+            return;
+        }
+        for (const id of reasoningById.keys()) {
+            emitEvent({ type: 'thinking_end', thinkingId: id });
+        }
+        reasoningById.clear();
+    };
+
     try {
         logInfo(`[Agent] Starting agent execution for project: ${request.projectPath}`);
 
@@ -445,28 +556,85 @@ export async function executeAgent(
         logInfo(`[Agent] Runtime version detected: ${runtimeVersion ?? 'unknown'}`);
         const systemPromptSelection = getSystemPrompt(runtimeVersion);
 
-        // Resolve memory setting early — needed for both system prompt and tool registration.
-        const memoryEnabled = request.memoryEnabled ?? ENABLE_MEMORY_TOOL;
-
         // System message (cache control will be added dynamically by prepareStep)
-        // Adding a cache block here because tools + system would be same for all users who use our proxy
+        // Adding a cache block here because tools + system would be same for all users who use our proxy.
+        // 1h TTL: system prompt is stable per-session; via proxy it's cross-user-warm (shared org),
+        // and for own-key users it survives idle/thinking gaps >5m. Cache write costs 2× base (vs 1.25× for 5m).
         const systemMessage: SystemModelMessage = {
             role: 'system',
             content: systemPromptSelection.prompt,
             providerOptions: {
                 anthropic: {
-                    cacheControl: { type: 'ephemeral' }
+                    cacheControl: { type: 'ephemeral', ttl: '1h' }
                 }
             }
         } as SystemModelMessage;
 
-        // Include env + connector context only on first message or after compaction
+        // Resolve the web-tool provider once for this turn.
+        // - Anthropic/Proxy paths get Anthropic's first-party server tools registered
+        //   directly on the main streamText call (no wrapper, no extra LLM round-trip).
+        // - Bedrock + Tavily key gets the Tavily-backed local tool.
+        // - Bedrock + no key omits the tools and relies on the `web_search_unavailable`
+        //   system reminder to steer the model away.
+        const loginMethod = await getLoginMethod();
+        const isBedrock = loginMethod === LoginMethod.AWS_BEDROCK;
+        const tavilyKey = isBedrock ? (await getTavilyApiKey()) : null;
+        const webSearchUnavailable = isBedrock && !tavilyKey;
+        const webToolsProvider: WebToolsProvider =
+            isBedrock ? (tavilyKey ? 'tavily-local' : 'none') : 'anthropic-server';
+        const anthropicProviderForWebTools =
+            webToolsProvider === 'anthropic-server' ? await getAnthropicProvider() : undefined;
+
+        // Per-block re-injection decision. For each tracked block (env, connectors,
+        // web availability, mode policy, payloads) compute a current hash, compare
+        // to the value persisted on session metadata, and decide:
+        //   - 'omit'            : block is unchanged, skip rendering it
+        //   - 'first-injection' : never injected before (or full re-prime needed),
+        //                         render without a "[context updated]" notice
+        //   - 're-injection'    : value drifted, render with a notice so the model
+        //                         knows something changed
+        // First message and post-compaction force first-injection on every block —
+        // model has lost prior context so we re-prime everything without notices.
         const isFirstMessage = chatHistory.length === 0;
         const isPostCompaction = chatHistory.length > 0
             && (chatHistory[0] as any)?._compactSynthetic === true;
-        const includeSessionContext = isFirstMessage || isPostCompaction;
+        const forceFirstInjection = isFirstMessage || isPostCompaction;
 
-        // Build user prompt
+        const sessionContextResult = await computeSessionContextBlockHashes({
+            projectPath: request.projectPath,
+            runtimeVersion,
+            webSearchUnavailable,
+            loginMethod,
+            mode: request.mode || 'edit',
+        });
+        const currentBlockHashes = sessionContextResult.hashes;
+        const sessionMetadata = request.chatHistoryManager
+            ? await request.chatHistoryManager.loadMetadata()
+            : null;
+        const previousBlocks = sessionMetadata?.sessionContextBlocks ?? {};
+
+        const blockStatuses: BlockInjectionStatuses = {
+            env: decideBlockStatus(currentBlockHashes.env, previousBlocks.env, forceFirstInjection),
+            connectors: decideBlockStatus(currentBlockHashes.connectors, previousBlocks.connectors, forceFirstInjection),
+            webAvailability: decideBlockStatus(currentBlockHashes.webAvailability, previousBlocks.webAvailability, forceFirstInjection),
+            modePolicy: decideBlockStatus(currentBlockHashes.modePolicy, previousBlocks.modePolicy, forceFirstInjection),
+            payloads: decideBlockStatus(currentBlockHashes.payloads, previousBlocks.payloads, forceFirstInjection),
+        };
+        const previousMode = previousBlocks.modePolicy as AgentMode | undefined;
+
+        // Persist the new hashes for any block we're about to inject. Eagerly:
+        // a crash between persist and the request reaching the model means the
+        // next turn skips injection — same failure mode as the original
+        // first-message-only behavior, so no regression vs prior behavior.
+        const updatedBlocks = buildUpdatedBlocksState(previousBlocks, currentBlockHashes, blockStatuses);
+        if (updatedBlocks && request.chatHistoryManager) {
+            await request.chatHistoryManager.updateMetadata({ sessionContextBlocks: updatedBlocks });
+            logBlockInjectionDrift(blockStatuses, previousBlocks, currentBlockHashes);
+        }
+
+        // Build user prompt — pass the pre-built sessionContextResult so
+        // getUserPrompt skips the second pass of pom.xml read, .git/HEAD read,
+        // and connector-store catalog lookup.
         const userPromptParams: UserPromptParams = {
             query: request.query,
             mode: request.mode || 'edit',
@@ -474,7 +642,11 @@ export async function executeAgent(
             sessionId,
             runtimeVersion,
             runtimeVersionDetected: systemPromptSelection.runtimeVersionDetected,
-            includeSessionContext,
+            webSearchUnavailable,
+            loginMethod,
+            blockStatuses,
+            previousMode,
+            precomputedContext: sessionContextResult,
         };
         const userPromptBlocks = await getUserPrompt(userPromptParams);
 
@@ -557,36 +729,16 @@ export async function executeAgent(
             pendingQuestions,
             pendingApprovals,
             getAnthropicClient,
-            webAccessPreapproved: request.webAccessPreapproved === true,
+            webToolsProvider,
+            anthropicProvider: anthropicProviderForWebTools,
+            tavilyApiKey: tavilyKey || undefined,
             shellApprovalRuleStore: request.shellApprovalRuleStore,
             undoCheckpointManager: request.undoCheckpointManager,
             abortSignal: streamWatchdog.abortSignal,
             modelSettings: request.modelSettings,
         });
 
-        // Add Anthropic native provider tools (memory).
-        // tool_search is now a local tool in createAgentTools — no provider dependency.
-        let finalTools: any = tools;
-        const anthropicProvider = memoryEnabled ? await getAnthropicProvider() : null;
-
-        // Memory tool: project-scoped persistent memory across sessions.
-        // Claude auto-checks /memories at the start of each turn (built-in protocol).
-        // Controlled by user setting (default off) or hardcoded flag for development.
-        if (memoryEnabled && anthropicProvider) {
-            const memoriesDir = getCopilotProjectMemoriesDir(request.projectPath);
-            const mode = request.mode || 'edit';
-            const baseExecute = createMemoryExecute(memoriesDir);
-            const memoryExecute = (mode === 'ask' || mode === 'plan')
-                ? createReadOnlyMemoryExecute(baseExecute)
-                : baseExecute;
-            finalTools = {
-                ...finalTools,
-                memory: anthropicProvider.tools.memory_20250818({
-                    execute: memoryExecute,
-                }),
-            };
-            logInfo(`[Agent] Memory tool enabled (mode=${mode}), dir: ${memoriesDir}`);
-        }
+        const finalTools: any = tools;
 
         // Track step number for logging
         let currentStepNumber = 0;
@@ -655,12 +807,14 @@ export async function executeAgent(
         };
 
         // Configure Anthropic provider options.
-        // When thinking is enabled, keep reasoning in model messages for JSONL replay.
+        // - `adaptive` lets the model decide whether to think per step.
+        // - `effort: 'low'` biases adaptive toward skipping for simple steps.
+        // - `display: 'summarized'` is required on Opus 4.7 (default changed to
+        //   'omitted' there) to actually surface reasoning text to the UI;
+        //   harmless on Sonnet which already defaults to summarized.
         const anthropicOptions: AnthropicProviderOptions = request.thinking
-        // NOTE: Current pinned @ai-sdk/anthropic types support enabled/disabled thinking.
-        // Adaptive thinking can be enabled once the SDK is upgraded in this repo.
-        ? { thinking: { type: 'adaptive' }, effort: 'low' }
-        : {};
+            ? { thinking: { type: 'adaptive', display: 'summarized' } as any, effort: 'low' }
+            : {};
 
         // Native server-side compaction: Anthropic auto-summarizes the conversation
         // when input tokens exceed the trigger threshold. The compaction block is
@@ -683,10 +837,14 @@ export async function executeAgent(
             };
         }
 
-        // Build beta headers: include compaction beta when native compaction is enabled.
+        // Bedrock InvokeModel rejects `defer_loading` on `type: "custom"` tools unless the
+        // tool-search beta is set (the SDK auto-adds it only when a server-side tool_search
+        // tool is in the tools array, which we don't use). On direct Anthropic the header is
+        // a no-op for custom-tool defer_loading, so we add it unconditionally on Bedrock.
         const betaHeaders = [
             ...(request.thinking ? ['interleaved-thinking-2025-05-14'] : []),
             ...(ENABLE_NATIVE_COMPACTION ? ['compact-2026-01-12'] : []),
+            ...(isBedrock ? ['tool-search-tool-2025-10-19'] : []),
         ];
     const requestHeaders = betaHeaders.length > 0
         ? { 'anthropic-beta': betaHeaders.join(',') }
@@ -707,9 +865,6 @@ export async function executeAgent(
             providerOptions: {
                 anthropic: {
                     ...anthropicOptions,
-                    // DeepWiki MCP — Anthropic handles MCP calls server-side.
-                    // Tool calls appear in the stream as mcp_tool_use / mcp_tool_result blocks.
-                    mcpServers: [DEEPWIKI_MCP_SERVER_CONFIG],
                 },
             },
             prepareStep,
@@ -742,9 +897,10 @@ export async function executeAgent(
                         `Input: ${inputTokens} | Cache Read: ${cachedInputTokens} | ` +
                         `Output: ${outputTokens} | Cache ratio: ${inputTokens > 0 ? (cachedInputTokens / (inputTokens + cachedInputTokens) * 100).toFixed(1) : '0'}%`);
 
-                    // Emit usage event to UI
-                    const totalInputTokens = inputTokens + cachedInputTokens;
-                    emitEvent({ type: 'usage', totalInputTokens });
+                    // Emit usage event to UI.
+                    // AI SDK v6: step.usage.inputTokens is the total (noCache + cacheRead + cacheWrite).
+                    // Do NOT add cachedInputTokens — it's a deprecated alias for cacheReadTokens and would double-count.
+                    emitEvent({ type: 'usage', totalInputTokens: inputTokens });
                 }
 
                 // Save only unsaved messages from this step
@@ -760,9 +916,7 @@ export async function executeAgent(
                         }
 
                         if (unsavedMessages.length > 0) {
-                            const totalInputTokens = step.usage
-                                ? (step.usage.inputTokens || 0) + (step.usage.cachedInputTokens || 0)
-                                : undefined;
+                            const totalInputTokens = step.usage?.inputTokens;
                             await request.chatHistoryManager.saveMessages(
                                 unsavedMessages,
                                 totalInputTokens !== undefined
@@ -812,8 +966,8 @@ export async function executeAgent(
         const toolInputMap = new Map<string, any>();
         // Track tool calls that already emitted a pre-input loading state.
         const preloadedToolCallIds = new Set<string>();
-        // Track reasoning text by block ID and emit complete thinking blocks on end.
-        const reasoningById = new Map<string, string>();
+        // (reasoningById + flushOpenThinkingBlocks declared above the try so
+        // catch / unexpected-end paths can flush too.)
         // Track whether the current text block is a native compaction summary.
         let isCompactionBlock = false;
         let compactionContent = '';
@@ -1015,10 +1169,12 @@ export async function executeAgent(
                         displayInput = { file_path: toolInput?.file_path };
                     } else if (part.toolName === CONNECTOR_TOOL_NAME) {
                         displayInput = {
-                            name: toolInput?.name,
-                            include_full_descriptions: toolInput?.include_full_descriptions,
+                            mode: toolInput?.mode,
+                            artifact_id: toolInput?.artifact_id,
                             operation_names: toolInput?.operation_names,
                             connection_names: toolInput?.connection_names,
+                            parameter_names: toolInput?.parameter_names,
+                            version: toolInput?.version,
                         };
                     } else if (part.toolName === CONTEXT_TOOL_NAME) {
                         displayInput = {
@@ -1027,8 +1183,9 @@ export async function executeAgent(
                     } else if (part.toolName === MANAGE_CONNECTOR_TOOL_NAME) {
                         displayInput = {
                             operation: toolInput?.operation,
-                            connector_names: toolInput?.connector_names,
-                            inbound_endpoint_names: toolInput?.inbound_endpoint_names,
+                            connector_artifact_ids: toolInput?.connector_artifact_ids,
+                            inbound_artifact_ids: toolInput?.inbound_artifact_ids,
+                            versions: toolInput?.versions,
                         };
                     } else if (part.toolName === VALIDATE_CODE_TOOL_NAME) {
                         displayInput = {
@@ -1074,9 +1231,11 @@ export async function executeAgent(
                             allowed_domains: toolInput?.allowed_domains,
                             blocked_domains: toolInput?.blocked_domains,
                         };
-                    } else if (DEEPWIKI_MCP_TOOL_NAMES.includes(part.toolName)) {
-                        // DeepWiki MCP tools — pass through all input for display
-                        displayInput = toolInput;
+                    } else if (part.toolName === DEEPWIKI_ASK_QUESTION_TOOL_NAME) {
+                        displayInput = {
+                            repoName: toolInput?.repoName,
+                            question: toolInput?.question,
+                        };
                     }
 
                     // Skip tool call UI for todo_write (handled by inline todo list)
@@ -1148,6 +1307,10 @@ export async function executeAgent(
                     cleanupStreamLifecycle?.();
                     const errorMsg = getErrorMessage(part.error);
                     logError(`[Agent] Stream error: ${errorMsg}`);
+                    // Structured diagnostics only — getErrorDiagnostics whitelists/truncates
+                    // the safe provider fields. A raw JSON dump would re-introduce the leak
+                    // surface (requestBodyValues, unsanitized headers, etc.) at any log level.
+                    logError(`[Agent] Stream error diagnostics: ${getErrorDiagnostics(part.error)}`);
                     emitEvent({
                         type: 'error',
                         error: errorMsg,
@@ -1199,6 +1362,8 @@ export async function executeAgent(
                         await flushNativeCompaction();
                     }
 
+                    // Close any reasoning blocks Anthropic didn't end explicitly.
+                    flushOpenThinkingBlocks();
                     cleanupStreamLifecycle?.();
                     logInfo(`[Agent] Execution finished. Modified files: ${modifiedFiles.length}`);
                     const finishReason = normalizeFinishReason(part);
@@ -1231,6 +1396,7 @@ export async function executeAgent(
         }
 
         // Stream completed without finish event (shouldn't happen normally)
+        flushOpenThinkingBlocks();
         cleanupStreamLifecycle?.();
         // Capture partial messages if available, but do not block forever waiting for response.
         try {
@@ -1254,6 +1420,7 @@ export async function executeAgent(
         };
 
     } catch (error: any) {
+        flushOpenThinkingBlocks();
         cleanupStreamLifecycle?.();
         const abortReason = streamWatchdog?.getAbortReason();
         const classifiedError = classifyAgentExecutionError({

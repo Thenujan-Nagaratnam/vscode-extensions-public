@@ -44,6 +44,7 @@ export type {
     PlanApprovalResponse,
     // Session management types
     SessionMetadata,
+    SessionContextBlocksState,
     SessionSummary,
     GroupedSessions,
     ListSessionsRequest,
@@ -65,9 +66,6 @@ export type {
     MainModelPreset,
     SubModelPreset,
     ModelSettings,
-    // Memory management types
-    ClearAgentMemoryResponse,
-    OpenAgentMemoryFolderResponse,
 } from './types';
 
 // Export RPC type definitions
@@ -90,9 +88,6 @@ export {
     searchMentionablePaths,
     // Run status RPC
     getAgentRunStatus,
-    // Memory management RPC
-    clearAgentMemory,
-    openAgentMemoryFolder,
 } from './rpc-type';
 
 // Export RPC request/response types

@@ -30,7 +30,6 @@ import Attachments from "./Attachments";
 // Tool name constant
 const SHELL_TOOL_NAMES = new Set(['shell', 'bash']);
 const EXIT_PLAN_MODE_TOOL_NAME = 'exit_plan_mode';
-const WEB_ACCESS_PREFERENCE_KEY = 'mi-agent-web-access-enabled';
 
 function appendThinkingPlaceholder(content: string, thinkingId: string): string {
     return `${content}\n\n<thinking data-id="${thinkingId}" data-loading="true"></thinking>`;
@@ -70,7 +69,12 @@ function appendThinkingDelta(content: string, thinkingId: string, delta: string)
         content.includes(`<thinking data-id="${thinkingId}">`);
 
     if (!hasExistingBlock) {
-        return appendThinkingPlaceholder(content, thinkingId).replace("</thinking>", `${delta}</thinking>`);
+        // Build the new placeholder directly with the delta inside. The previous
+        // approach (appendThinkingPlaceholder + .replace("</thinking>", …))
+        // matched the FIRST </thinking> in content, so a delta arriving without
+        // its start (e.g. during panel reconnect / event replay) would inject
+        // into a prior finalized block instead of the new one.
+        return `${content}\n\n<thinking data-id="${thinkingId}" data-loading="true">${delta}</thinking>`;
     }
 
     return updateThinkingContent(content, thinkingId, (current) => current + delta);
@@ -163,10 +167,6 @@ function getApprovalFallbackContent(
             return 'Agent recommends entering Plan mode. Do you want to switch now?';
         case 'exit_plan_mode_without_plan':
             return 'Agent wants to exit Plan mode without a full plan. Do you want to continue?';
-        case 'web_search':
-            return 'Agent wants permission to run a web search.';
-        case 'web_fetch':
-            return 'Agent wants permission to fetch a web page.';
         case 'shell_command':
             return 'Agent wants permission to run a shell command.';
         case 'continue_after_limit':
@@ -180,9 +180,6 @@ function getApprovalTitle(approvalKind: PlanApprovalKind | undefined): string {
     switch (approvalKind) {
         case 'exit_plan_mode':
             return 'Plan Approval';
-        case 'web_search':
-        case 'web_fetch':
-            return 'Web Access Approval';
         case 'shell_command':
             return 'Shell Access Approval';
         case 'continue_after_limit':
@@ -367,27 +364,32 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
         agentMode,
         setAgentMode,
         isThinkingEnabled,
-        isMemoryEnabled,
         modelSettings,
+        currentSessionId,
     } = useMICopilotContext();
 
     const [, setFileUploadStatus] = useState({ type: "", text: "" });
     const isResponseReceived = useRef(false);
     const textAreaRef = useRef<HTMLTextAreaElement>(null);
     const abortedRef = useRef(false);
+    // chatId of the currently-running (or most-recently-started) agent turn.
+    // Any inbound event stamped with a different chatId belongs to a prior
+    // interrupted run and must be ignored, otherwise late content_block /
+    // tool_result events would bleed into the new conversation.
+    //
+    // On session switch we set this to DROP_ALL_RUN_CHAT_ID (a negative
+    // sentinel that cannot collide with generateId()'s 8-digit positive
+    // range) so stamped events for the previous session are rejected until
+    // the new run establishes its chatId via handleSend or
+    // restoreAgentRunStatus.
+    const DROP_ALL_RUN_CHAT_ID = -1;
+    const activeRunChatIdRef = useRef<number | undefined>(undefined);
     const lastUserPromptRef = useRef<string>("");
     const [isFocused, setIsFocused] = useState(false);
     const isDarkMode = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
 
     // Mode switcher state
     // Mode switcher is now a pill group (no dropdown menu needed)
-    const [isWebAccessEnabled, setIsWebAccessEnabled] = useState<boolean>(() => {
-        try {
-            return localStorage.getItem(WEB_ACCESS_PREFERENCE_KEY) === 'true';
-        } catch {
-            return false;
-        }
-    });
 
     // Manual compact state
     const [isCompacting, setIsCompacting] = useState(false);
@@ -492,16 +494,33 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
         clearWorkingOnItPlaceholder();
     }, [clearWorkingOnItPlaceholder, clearWorkingOnItTimer]);
 
+
     // Handle agent streaming events from extension
     // Uses refs for values that change between renders (assistantResponseRef, currentChatIdRef)
     // to avoid stale closure issues since this callback is registered once via onAgentEvent.
     const handleAgentEvent = useCallback((event: AgentEvent) => {
-        // Ignore all events if generation was aborted
-        if (abortedRef.current) {
+        // Drop events stamped with a prior run's chatId. Without this, a
+        // content_block / tool_result that arrives after the user interrupted
+        // and started a new turn would render into the fresh conversation.
+        // Done before the abortedRef guard because the ref is reset when the
+        // new run begins and would no longer protect us.
+        //
+        // Must also precede the ENABLE_STREAM_SAFEGUARDS block below — a
+        // late stop/abort from the prior run would otherwise flip
+        // terminalEventReceivedRef and stop the polling loop for the ACTIVE
+        // run, or bump lastReceivedSeqRef past events we still need.
+        if (
+            event.chatId !== undefined &&
+            activeRunChatIdRef.current !== undefined &&
+            event.chatId !== activeRunChatIdRef.current
+        ) {
             return;
         }
 
-        // Track sequence number and timestamp for polling fallback
+        // Track sequence number and timestamp for polling fallback. Do this
+        // even when events are being dropped by the abort guard below — the
+        // polling loop still needs to know a terminal event arrived so it can
+        // stop.
         if (ENABLE_STREAM_SAFEGUARDS) {
             if (event.seq !== undefined && event.seq > lastReceivedSeqRef.current) {
                 lastReceivedSeqRef.current = event.seq;
@@ -510,6 +529,14 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
             if (event.type === 'stop' || event.type === 'error' || event.type === 'abort') {
                 terminalEventReceivedRef.current = true;
             }
+        }
+
+        // Ignore all events if generation was aborted by the user. The UI has
+        // already been finalized optimistically in handleInterrupt; late
+        // streaming events (content, tool_call, tool_result, etc.) would only
+        // re-render content that's no longer relevant.
+        if (abortedRef.current) {
+            return;
         }
 
         switch (event.type) {
@@ -709,33 +736,13 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
                 break;
 
             case "abort":
-                // Abort acknowledged - finalize with partial content and "[Interrupted]" marker
-                clearWorkingOnItTimer();
-                clearWorkingOnItPlaceholder();
-                setBackendRequestTriggered(false);
-                setPendingQuestion(null);
-                clearPendingApprovals();
-                setShowRejectionInput(false);
-                setPlanRejectionFeedback("");
-                resetApprovalUiState();
-                setOtherAnswers(new Map());
-                setMessages((prevMessages) => {
-                    if (prevMessages.length === 0) return prevMessages;
-                    const newMessages = [...prevMessages];
-                    const lastIdx = newMessages.length - 1;
-                    const lastMessage = newMessages[lastIdx];
-                    if (lastMessage.role === Role.MICopilot) {
-                        let content = lastMessage.content.replace(/<toolcall data-loading="true"[^>]*>[^<]*<\/toolcall>/g, '');
-                        content = content.trim();
-                        content = content
-                            ? content + "\n\n*[Interrupted by user]*"
-                            : "*[Interrupted by user]*";
-                        newMessages[lastIdx] = { ...lastMessage, content };
-                    }
-                    return newMessages;
-                });
-                setAssistantResponse("");
-                setToolStatus("");
+                // Abort acknowledged by backend. When the user clicked Interrupt the
+                // UI has already been finalized optimistically with the "by user"
+                // marker; this branch covers backend-initiated aborts (watchdog,
+                // rpc-manager catch) where we should use the neutral marker. The
+                // helper is idempotent and the marker check in finalizeInterruptionUi
+                // prevents stacking when both paths fire.
+                finalizeInterruptionUi(abortedRef.current ? 'user' : 'backend');
                 break;
 
             case "stop":
@@ -991,22 +998,35 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
         }
     };
 
-    const handleInterrupt = async () => {
+    const handleInterrupt = () => {
         if (!backendRequestTriggered) {
             return;
         }
-        // Close any pending approval/question dialogs immediately in UI.
-        setPendingQuestion(null);
-        clearPendingApprovals();
-        setShowRejectionInput(false);
-        setPlanRejectionFeedback("");
-        resetApprovalUiState();
-        setOtherAnswers(new Map());
-        try {
-            await rpcClient.getMiAgentPanelRpcClient().abortAgentGeneration();
-        } catch (error) {
-            console.error("Error interrupting generation:", error);
-        }
+        // Optimistic UI: flip button back to Send, drop late events, and append
+        // the "[Interrupted]" marker synchronously — no waiting on the backend.
+        // The 'abort' event handler below remains a safety net for backend-
+        // initiated aborts (watchdog timeout, etc.) and re-entry is idempotent.
+        abortedRef.current = true;
+        // Release the send guard as part of the same optimistic flip.
+        // Without this, the outstanding sendAgentMessage RPC keeps
+        // sendInProgressRef.current=true until its finally runs, so a user
+        // pressing Send again after the interrupt sees the button appear
+        // enabled (backendRequestTriggered was cleared) but handleSend bails
+        // out on the sendInProgressRef guard.
+        sendInProgressRef.current = false;
+        finalizeInterruptionUi('user');
+
+        // Fire-and-forget the abort RPC so the backend can tear down in
+        // parallel. Tools that honor mainAbortSignal (shell, maven build, web
+        // tools, subagents, etc.) will hard-kill; tools that don't will
+        // complete on their own schedule but their events are ignored by the
+        // abortedRef guard in handleAgentEvent.
+        rpcClient
+            .getMiAgentPanelRpcClient()
+            .abortAgentGeneration()
+            .catch((error) => {
+                console.error("Error interrupting generation:", error);
+            });
     };
 
 
@@ -1129,6 +1149,9 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
             return;
         }
 
+        // Lift the abort guard so events for THIS run aren't dropped by a prior
+        // interrupt. Must happen before any streaming state is set up.
+        abortedRef.current = false;
         sendInProgressRef.current = true;
         closeMentionSuggestions();
         // Clear input immediately so user can't send the same message again while compacting.
@@ -1157,6 +1180,10 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
             ? crypto.randomUUID()
             : `checkpoint-${Date.now()}-${Math.random().toString(16).slice(2)}`;
         setCurrentChatId(chatId);
+        // Remember this run's chatId so handleAgentEvent can drop any
+        // late events stamped with a prior chatId after the user interrupted
+        // and started a fresh turn.
+        activeRunChatIdRef.current = chatId;
 
         const updateChats = (userPrompt: string, userMessageType?: MessageType, checkpointAnchorId?: string) => {
             // Store the user prompt for potential abort restoration
@@ -1233,8 +1260,6 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
                 files,
                 images,
                 thinking: isThinkingEnabled,
-                memoryEnabled: isMemoryEnabled,
-                webAccessPreapproved: isWebAccessEnabled,
                 chatHistory: chatHistory,
                 modelSettings,
             });
@@ -1265,20 +1290,35 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
                 // Abort event already updates UI with interruption state.
                 return;
             }
-            setMessages((prevMessages) => {
-                const newMessages = [...prevMessages];
-                const lastIdx = newMessages.length - 1;
-                const cleanedContent = removeWorkingOnItToolCallTag(newMessages[lastIdx].content);
-                newMessages[lastIdx].content = cleanedContent + errorMessage;
-                newMessages[newMessages.length - 1].type = MessageType.Error;
-                return newMessages;
-            });
-            console.error("Error sending agent message:", error);
+            // Only surface the error if this completion still belongs to the
+            // active run. If the user interrupted and started a fresh turn,
+            // the stale RPC's rejection would otherwise corrupt the new
+            // run's last message with an error marker.
+            if (activeRunChatIdRef.current !== chatId) {
+                console.error("Error sending agent message (stale run, suppressed UI):", error);
+            } else {
+                setMessages((prevMessages) => {
+                    const newMessages = [...prevMessages];
+                    const lastIdx = newMessages.length - 1;
+                    const cleanedContent = removeWorkingOnItToolCallTag(newMessages[lastIdx].content);
+                    newMessages[lastIdx].content = cleanedContent + errorMessage;
+                    newMessages[newMessages.length - 1].type = MessageType.Error;
+                    return newMessages;
+                });
+                console.error("Error sending agent message:", error);
+            }
         } finally {
+            // Run-scoped cleanup: only reset shared state when this finally
+            // belongs to the CURRENT active run. If handleInterrupt fired and
+            // a new handleSend has already taken over, activeRunChatIdRef
+            // points at the new chatId — clobbering backendRequestTriggered
+            // or sendInProgressRef here would drop the new run's gating.
             clearWorkingOnItTimer();
-            setCurrentUserprompt("");
-            setBackendRequestTriggered(false);
-            sendInProgressRef.current = false;
+            if (activeRunChatIdRef.current === chatId) {
+                setCurrentUserprompt("");
+                setBackendRequestTriggered(false);
+                sendInProgressRef.current = false;
+            }
         }
     }
 
@@ -1308,20 +1348,23 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
         setPendingMentionCursorPosition(null);
     }, [pendingMentionCursorPosition, currentUserPrompt]);
 
-    useEffect(() => {
-        try {
-            localStorage.setItem(WEB_ACCESS_PREFERENCE_KEY, String(isWebAccessEnabled));
-        } catch {
-            // Ignore localStorage errors in restricted environments
-        }
-    }, [isWebAccessEnabled]);
-
     // Set up agent event listener
     useEffect(() => {
         if (rpcClient) {
             rpcClient.onAgentEvent(handleAgentEvent);
         }
     }, [rpcClient, handleAgentEvent]);
+
+    // Clear the interrupt guard when the active session changes so events
+    // streamed for the newly-switched session aren't dropped by a prior
+    // interrupt that belonged to a different session. Also park the active
+    // run chatId at DROP_ALL_RUN_CHAT_ID so any late events addressed to the
+    // prior session's run are rejected until handleSend or
+    // restoreAgentRunStatus establishes the new run's chatId.
+    useEffect(() => {
+        abortedRef.current = false;
+        activeRunChatIdRef.current = DROP_ALL_RUN_CHAT_ID;
+    }, [currentSessionId]);
 
     // Restore in-progress/completed run state when the panel reconnects.
     useEffect(() => {
@@ -1351,6 +1394,19 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
                 if (runStatus.isRunning) {
                     setBackendRequestTriggered(true);
                 }
+
+                // Adopt the restored run's chatId BEFORE replaying events so
+                // the chatId-mismatch guard in handleAgentEvent accepts them.
+                // After a session switch activeRunChatIdRef is parked at
+                // DROP_ALL_RUN_CHAT_ID, which would otherwise reject the
+                // buffered events. If the buffer has no event with a chatId
+                // (e.g. isRunning with no events yet), fall back to undefined
+                // so incoming push events are accepted until one supplies a
+                // chatId.
+                const restoredChatId = bufferedEvents.find(
+                    (e): e is AgentEvent & { chatId: number } => typeof e.chatId === 'number'
+                )?.chatId;
+                activeRunChatIdRef.current = restoredChatId;
 
                 setMessages((prev) => {
                     if (prev.length > 0 && prev[prev.length - 1].role === Role.MICopilot) {
@@ -1476,6 +1532,56 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
         setShellFocusedOption(0);
         setAnswers(new Map());
     }, []);
+
+    // Shared finalizer for both user-clicked interrupts (optimistic, runs before
+    // the backend replies) and backend-initiated aborts (watchdog timeout,
+    // rpc-manager catch) delivered via the 'abort' event. Idempotent — safe to
+    // call multiple times; re-runs skip appending the marker if already present.
+    // `origin` controls the inline marker so backend aborts don't falsely
+    // claim the user interrupted when they didn't.
+    const finalizeInterruptionUi = useCallback((origin: 'user' | 'backend' = 'user') => {
+        const marker = origin === 'user' ? '*[Interrupted by user]*' : '*[Interrupted]*';
+        clearWorkingOnItTimer();
+        clearWorkingOnItPlaceholder();
+        setBackendRequestTriggered(false);
+        setPendingQuestion(null);
+        clearPendingApprovals();
+        setShowRejectionInput(false);
+        setPlanRejectionFeedback("");
+        resetApprovalUiState();
+        setOtherAnswers(new Map());
+        setMessages((prevMessages) => {
+            if (prevMessages.length === 0) return prevMessages;
+            const newMessages = [...prevMessages];
+            const lastIdx = newMessages.length - 1;
+            const lastMessage = newMessages[lastIdx];
+            if (lastMessage.role !== Role.MICopilot) {
+                return prevMessages;
+            }
+            let content = lastMessage.content
+                .replace(/<toolcall data-loading="true"[^>]*>[^<]*<\/toolcall>/g, '')
+                .replace(/<bashoutput data-loading="true"[^>]*>[\s\S]*?<\/bashoutput>/g, '');
+            content = content.trim();
+            // Either marker counts as "already finalized" — prevents the
+            // second path (user then backend, or vice versa) from stacking.
+            if (content.endsWith('*[Interrupted by user]*') || content.endsWith('*[Interrupted]*')) {
+                return prevMessages;
+            }
+            content = content ? content + '\n\n' + marker : marker;
+            newMessages[lastIdx] = { ...lastMessage, content };
+            return newMessages;
+        });
+        setAssistantResponse("");
+        setToolStatus("");
+    }, [
+        clearPendingApprovals,
+        clearWorkingOnItPlaceholder,
+        clearWorkingOnItTimer,
+        resetApprovalUiState,
+        setBackendRequestTriggered,
+        setMessages,
+        setPendingQuestion,
+    ]);
 
     const handlePlanApprovalCancel = async () => {
         await handleQuestionCancel();
@@ -2061,7 +2167,9 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
                             lineHeight: "1.5",
                             whiteSpace: "pre-wrap",
                             overflowWrap: "anywhere",
-                            marginBottom: "6px"
+                            marginBottom: "6px",
+                            maxHeight: "180px",
+                            overflowY: "auto"
                         }}>
                             {pendingPlanApproval.shellCommand || ''}
                         </div>
@@ -2682,35 +2790,6 @@ const AIChatFooter: React.FC<AIChatFooterProps> = ({ isUsageExceeded = false }) 
                                 );
                             })}
                         </div>
-
-                        {/* Web search toggle */}
-                        <FooterTooltip
-                            align="start"
-                            content="Enable web search and fetch without approval prompts"
-                        >
-                            <button
-                                type="button"
-                                onClick={() => setIsWebAccessEnabled((prev) => !prev)}
-                                disabled={isUsageExceeded || backendRequestTriggered}
-                                aria-pressed={isWebAccessEnabled}
-                                className="flex items-center justify-center rounded-md transition-colors"
-                                style={{
-                                    width: "26px",
-                                    height: "26px",
-                                    border: "none",
-                                    cursor: (isUsageExceeded || backendRequestTriggered) ? "not-allowed" : "pointer",
-                                    backgroundColor: isWebAccessEnabled
-                                        ? "var(--vscode-button-background)"
-                                        : "transparent",
-                                    color: isWebAccessEnabled
-                                        ? "var(--vscode-button-foreground)"
-                                        : "var(--vscode-descriptionForeground)",
-                                    opacity: (isUsageExceeded || backendRequestTriggered) ? 0.5 : 1
-                                }}
-                            >
-                                <Codicon name="globe" />
-                            </button>
-                        </FooterTooltip>
 
                         {/* Context usage indicator — always visible */}
                         <FooterTooltip

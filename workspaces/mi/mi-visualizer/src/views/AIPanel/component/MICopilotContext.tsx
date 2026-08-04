@@ -156,10 +156,6 @@ interface MICopilotContextType {
     // Thinking mode
     isThinkingEnabled: boolean;
     setIsThinkingEnabled: React.Dispatch<React.SetStateAction<boolean>>;
-
-    // Memory mode
-    isMemoryEnabled: boolean;
-    setIsMemoryEnabled: React.Dispatch<React.SetStateAction<boolean>>;
 }
 
 // Define the context for MI Copilot
@@ -240,23 +236,29 @@ export function MICopilotContextProvider({ children }: MICopilotProviderProps) {
         return { ...DEFAULT_MODEL_SETTINGS };
     });
 
-    // Thinking mode state (persisted in localStorage per agent mode)
+    // Thinking mode state (persisted in localStorage per agent mode).
+    // Default ON: adaptive thinking + low effort + Opus 4.7 omitted-mode
+    // means it self-regulates and helps on multi-step reasoning. Users who
+    // explicitly turned it OFF keep their preference.
     const THINKING_KEY_PREFIX = 'mi-agent-thinking-enabled';
     const [isThinkingEnabled, setIsThinkingEnabled] = useState<boolean>(() => {
         try {
             const stored = localStorage.getItem(`${THINKING_KEY_PREFIX}-${agentMode}`);
-            return stored === 'true';
-        } catch { return false; }
+            return stored === null ? true : stored === 'true';
+        } catch { return true; }
     });
 
-    // Memory mode state (persisted in localStorage, default off)
-    const MEMORY_KEY = 'mi-agent-memory-enabled';
-    const [isMemoryEnabled, setIsMemoryEnabled] = useState<boolean>(() => {
+    // One-shot cleanup: the memory tool was removed entirely. Clear any
+    // persisted "on" state left over from prior versions so the key doesn't
+    // linger in the user's localStorage indefinitely. Safe to delete this
+    // block after a release or two.
+    useEffect(() => {
         try {
-            const stored = localStorage.getItem(MEMORY_KEY);
-            return stored === 'true';
-        } catch { return false; }
-    });
+            localStorage.removeItem('mi-agent-memory-enabled');
+        } catch {
+            /* ignore storage failures */
+        }
+    }, []);
 
     const updateModelSettings = useCallback((settings: ModelSettings) => {
         setModelSettingsState(settings);
@@ -502,8 +504,8 @@ export function MICopilotContextProvider({ children }: MICopilotProviderProps) {
     useEffect(() => {
         try {
             const stored = localStorage.getItem(`${THINKING_KEY_PREFIX}-${agentMode}`);
-            setIsThinkingEnabled(stored === 'true');
-        } catch { setIsThinkingEnabled(false); }
+            setIsThinkingEnabled(stored === null ? true : stored === 'true');
+        } catch { setIsThinkingEnabled(true); }
     }, [agentMode]);
 
     // Persist thinking preference to localStorage
@@ -512,13 +514,6 @@ export function MICopilotContextProvider({ children }: MICopilotProviderProps) {
             localStorage.setItem(`${THINKING_KEY_PREFIX}-${agentMode}`, String(isThinkingEnabled));
         } catch { /* ignore */ }
     }, [agentMode, isThinkingEnabled]);
-
-    // Persist memory preference to localStorage
-    useEffect(() => {
-        try {
-            localStorage.setItem(MEMORY_KEY, String(isMemoryEnabled));
-        } catch { /* ignore */ }
-    }, [isMemoryEnabled]);
 
     useEffect(() => {
         setRemaingTokenLessThanOne(remainingTokenPercentage < 1 && remainingTokenPercentage > 0);
@@ -587,9 +582,6 @@ export function MICopilotContextProvider({ children }: MICopilotProviderProps) {
         // Thinking mode
         isThinkingEnabled,
         setIsThinkingEnabled,
-        // Memory mode
-        isMemoryEnabled,
-        setIsMemoryEnabled,
     };
 
     return (

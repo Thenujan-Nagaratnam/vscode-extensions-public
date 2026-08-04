@@ -88,13 +88,20 @@ import {
     createWebSearchExecute,
     createWebFetchTool,
     createWebFetchExecute,
+    createAnthropicServerWebTools,
+    WebToolsProvider,
 } from '../../tools/web_tools';
+import type { AnthropicProvider } from '@ai-sdk/anthropic';
 import {
     createReadServerLogsTool,
     createReadServerLogsExecute,
 } from '../../tools/log_tools';
+import {
+    createDeepWikiTool,
+    createDeepWikiExecute,
+} from '../../tools/deepwiki_tools';
 import { createToolSearchTool } from '../../tools/tool_load';
-import { AnthropicModel, resolveMainModelId } from '../../../connection';
+import { AnthropicModel } from '../../../connection';
 import { AgentMode, ModelSettings } from '@wso2/mi-core';
 import { persistOversizedToolResult } from '../../tools/tool-result-persistence';
 import { analyzeShellCommand } from '../../tools/shell_sandbox';
@@ -124,6 +131,7 @@ import {
     ToolResult,
     WEB_SEARCH_TOOL_NAME,
     WEB_FETCH_TOOL_NAME,
+    DEEPWIKI_ASK_QUESTION_TOOL_NAME,
     READ_SERVER_LOGS_TOOL_NAME,
     TOOL_LOAD_TOOL_NAME,
     ShellApprovalRuleStore,
@@ -160,6 +168,7 @@ export {
     TASK_OUTPUT_TOOL_NAME,
     WEB_SEARCH_TOOL_NAME,
     WEB_FETCH_TOOL_NAME,
+    DEEPWIKI_ASK_QUESTION_TOOL_NAME,
     READ_SERVER_LOGS_TOOL_NAME,
     TOOL_LOAD_TOOL_NAME,
 };
@@ -187,8 +196,17 @@ export interface CreateToolsParams {
     pendingApprovals: Map<string, PendingPlanApproval>;
     /** Function to get Anthropic client for task tool */
     getAnthropicClient: (model: AnthropicModel) => Promise<any>;
-    /** Skip per-call web approval prompts for this run */
-    webAccessPreapproved: boolean;
+    /**
+     * Which web-tool implementation to register.
+     * - `anthropic-server`: native Anthropic `web_search` / `web_fetch` server tools (MI_INTEL Proxy + ANTHROPIC_KEY)
+     * - `tavily-local`: Tavily-backed local tools (AWS Bedrock with a Tavily key)
+     * - `none`: stubbed tools that return WEB_SEARCH/FETCH_NOT_CONFIGURED (Bedrock without a Tavily key)
+     */
+    webToolsProvider: WebToolsProvider;
+    /** Required when webToolsProvider === 'anthropic-server'. Resolved upstream in executeAgent. */
+    anthropicProvider?: AnthropicProvider;
+    /** Required when webToolsProvider === 'tavily-local'. */
+    tavilyApiKey?: string;
     /** Session-scoped shell approval rule store */
     shellApprovalRuleStore?: ShellApprovalRuleStore;
     /** Optional undo checkpoint manager for capturing pre-change states */
@@ -208,6 +226,7 @@ const READ_ONLY_MODE_ALLOWED_TOOLS = new Set<string>([
     VALIDATE_CODE_TOOL_NAME,
     WEB_SEARCH_TOOL_NAME,
     WEB_FETCH_TOOL_NAME,
+    DEEPWIKI_ASK_QUESTION_TOOL_NAME,
     SERVER_MANAGEMENT_TOOL_NAME,
     READ_SERVER_LOGS_TOOL_NAME,
 ]);
@@ -541,7 +560,7 @@ function createToolExecutionPipeline<T extends (...args: any[]) => Promise<ToolR
  * This ensures consistent tool definitions across main agent and compact agent.
  *
  * @param params - Tool creation parameters
- * @returns Tools object with all 23 tools
+ * @returns Tools object with all agent tools
  */
 export function createAgentTools(params: CreateToolsParams) {
     const {
@@ -554,16 +573,14 @@ export function createAgentTools(params: CreateToolsParams) {
         pendingQuestions,
         pendingApprovals,
         getAnthropicClient,
-        webAccessPreapproved,
+        webToolsProvider,
+        anthropicProvider,
+        tavilyApiKey,
         shellApprovalRuleStore,
         undoCheckpointManager,
         abortSignal,
         modelSettings,
     } = params;
-
-    // Resolve the main model ID for tools that need it (web search/fetch)
-    const mainModelId = modelSettings ? resolveMainModelId(modelSettings) : undefined;
-    const mainModelIsCustom = !!modelSettings?.mainModelCustomId;
 
     const getWrappedExecute = <T extends (...args: any[]) => Promise<ToolResult>>(
         toolName: string,
@@ -583,6 +600,37 @@ export function createAgentTools(params: CreateToolsParams) {
 
     // Shared set tracking files read in this session (for write tool's read-before-write guard)
     const readFiles = new Set<string>();
+
+    const buildWebTools = (): Record<string, unknown> => {
+        if (webToolsProvider === 'anthropic-server') {
+            if (!anthropicProvider) {
+                throw new Error("createAgentTools: webToolsProvider='anthropic-server' requires anthropicProvider.");
+            }
+            return createAnthropicServerWebTools(anthropicProvider);
+        }
+        if (webToolsProvider === 'tavily-local' && tavilyApiKey) {
+            return {
+                [WEB_SEARCH_TOOL_NAME]: createWebSearchTool(
+                    getWrappedExecute(WEB_SEARCH_TOOL_NAME, createWebSearchExecute(tavilyApiKey))
+                ),
+                [WEB_FETCH_TOOL_NAME]: createWebFetchTool(
+                    getWrappedExecute(WEB_FETCH_TOOL_NAME, createWebFetchExecute(tavilyApiKey))
+                ),
+            };
+        }
+        // 'none' (or the unreachable tavily-local-without-key fallback): register stubs
+        // that surface a clear NOT_CONFIGURED error if the model ignores the
+        // `web_search_unavailable` system reminder and calls them anyway.
+        const notConfigured = (kind: 'search' | 'fetch') => async (): Promise<ToolResult> => ({
+            success: false,
+            message: `Web ${kind} is not configured. Add a Tavily API key in the AI Panel settings (Web Search section) to enable it on AWS Bedrock.`,
+            error: kind === 'search' ? 'WEB_SEARCH_NOT_CONFIGURED' : 'WEB_FETCH_NOT_CONFIGURED',
+        });
+        return {
+            [WEB_SEARCH_TOOL_NAME]: createWebSearchTool(getWrappedExecute(WEB_SEARCH_TOOL_NAME, notConfigured('search'))),
+            [WEB_FETCH_TOOL_NAME]: createWebFetchTool(getWrappedExecute(WEB_FETCH_TOOL_NAME, notConfigured('fetch'))),
+        };
+    };
 
     const allTools = {
         // File Operations (6 tools)
@@ -605,7 +653,7 @@ export function createAgentTools(params: CreateToolsParams) {
 
         // Connector Tools (2 tools)
         [CONNECTOR_TOOL_NAME]: createConnectorTool(
-            getWrappedExecute(CONNECTOR_TOOL_NAME, createConnectorExecute(projectPath))
+            getWrappedExecute(CONNECTOR_TOOL_NAME, createConnectorExecute(projectPath, abortSignal))
         ),
         [CONTEXT_TOOL_NAME]: createContextTool(
             getWrappedExecute(CONTEXT_TOOL_NAME, createContextExecute(projectPath), false)
@@ -613,7 +661,7 @@ export function createAgentTools(params: CreateToolsParams) {
 
         // Project Tools (1 tool)
         [MANAGE_CONNECTOR_TOOL_NAME]: createManageConnectorTool(
-            getWrappedExecute(MANAGE_CONNECTOR_TOOL_NAME, createManageConnectorExecute(projectPath, undoCheckpointManager))
+            getWrappedExecute(MANAGE_CONNECTOR_TOOL_NAME, createManageConnectorExecute(projectPath, undoCheckpointManager, abortSignal))
         ),
 
         // LSP Tools (1 tool)
@@ -623,10 +671,10 @@ export function createAgentTools(params: CreateToolsParams) {
 
         // Data Mapper Tools (2 tools)
         [CREATE_DATA_MAPPER_TOOL_NAME]: createCreateDataMapperTool(
-            getWrappedExecute(CREATE_DATA_MAPPER_TOOL_NAME, createCreateDataMapperExecute(projectPath, modifiedFiles, undoCheckpointManager))
+            getWrappedExecute(CREATE_DATA_MAPPER_TOOL_NAME, createCreateDataMapperExecute(projectPath, modifiedFiles, undoCheckpointManager, abortSignal))
         ),
         [GENERATE_DATA_MAPPING_TOOL_NAME]: createGenerateDataMappingTool(
-            getWrappedExecute(GENERATE_DATA_MAPPING_TOOL_NAME, createGenerateDataMappingExecute(projectPath, modifiedFiles, undoCheckpointManager))
+            getWrappedExecute(GENERATE_DATA_MAPPING_TOOL_NAME, createGenerateDataMappingExecute(projectPath, modifiedFiles, undoCheckpointManager, abortSignal))
         ),
 
         // Runtime Tools (2 tools)
@@ -660,28 +708,10 @@ export function createAgentTools(params: CreateToolsParams) {
             getWrappedExecute(TODO_WRITE_TOOL_NAME, createTodoWriteExecute(eventHandler))
         ),
 
-        // Web Tools (2 tools)
-        [WEB_SEARCH_TOOL_NAME]: createWebSearchTool(
-            getWrappedExecute(WEB_SEARCH_TOOL_NAME, createWebSearchExecute(
-                getAnthropicClient,
-                eventHandler,
-                pendingApprovals,
-                webAccessPreapproved,
-                sessionId,
-                mainModelId,
-                mainModelIsCustom
-            ))
-        ),
-        [WEB_FETCH_TOOL_NAME]: createWebFetchTool(
-            getWrappedExecute(WEB_FETCH_TOOL_NAME, createWebFetchExecute(
-                getAnthropicClient,
-                eventHandler,
-                pendingApprovals,
-                webAccessPreapproved,
-                sessionId,
-                mainModelId,
-                mainModelIsCustom
-            ))
+        // Web Tools (2 tools) — branched by webToolsProvider, see CreateToolsParams
+        ...buildWebTools(),
+        [DEEPWIKI_ASK_QUESTION_TOOL_NAME]: createDeepWikiTool(
+            getWrappedExecute(DEEPWIKI_ASK_QUESTION_TOOL_NAME, createDeepWikiExecute(abortSignal))
         ),
 
         // Log Tools (1 tool)
