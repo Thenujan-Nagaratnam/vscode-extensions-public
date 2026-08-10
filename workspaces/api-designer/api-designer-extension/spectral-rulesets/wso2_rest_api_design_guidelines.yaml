@@ -597,7 +597,7 @@ rulesetContent:
         Name every path parameter (e.g. `/users/{userId}`) and ensure a matching `parameters` entry with `in: path` and `required: true`.
 
 
-    paths-no-trailing-slash:
+    paths-no-trailisasng-slash:
       given:
         - "#Path_Object"
       severity: error
@@ -659,7 +659,7 @@ rulesetContent:
       fixSuggestion: >-
         Set `info.contact.name` to your organization or API team name as shown to API consumers.
 
-    path-not-include-query:
+    path-not-inclasasude-query:
       given:
         - "#Path_Object"
       severity: warn
@@ -701,7 +701,7 @@ rulesetContent:
       fixSuggestion: >-
         Move query parameters out of the path string; use a clean path (e.g. `/users`) and define filters with `in: query` parameters.
 
-    tag-description:
+    tag-descasasription:
       given:
         - "#API_Tags_Item"
       severity: warn
